@@ -5,80 +5,6 @@ watchlist - it's an **attention allocator**: given a list of stocks, it tells
 you which ones actually deserve a look right now, and explains why in plain
 language.
 
-## The core idea: Meaningful Change Score (MCS)
-
-A raw "% change" number treats a 2% move in a sleepy PSU bank the same as a
-2% move in a small-cap that swings that much every day. MCS instead asks:
-*relative to how this stock normally behaves, is today's move actually
-unusual - and is anything corroborating it?*
-
-Four signals, each explainable on their own, combined into one 0-100 score
-(see `backend/app/scoring.py`):
-
-| Signal | What it measures |
-|---|---|
-| Volatility z-score | Is `\|% change\|` large vs. this stock's own trailing 20-day volatility? |
-| Volume ratio | Is volume unusually high vs. its trailing average (conviction, not just noise)? |
-| 52-week proximity | Is the move pushing the stock toward/through a real breakout level, in the direction it's already moving? |
-| Index divergence | Is the stock doing something different from Nifty 50 (idiosyncratic vs. "the whole market moved")? |
-
-The weights are simple, documented constants - not a hidden model - so the
-score stays explainable. Clicking any stock shows the score, a plain-English
-reason (e.g. *"Up 6.2% - a 5.6x larger move than its usual daily swing; on
-5.0x average volume; near its 52-week high"*), a breakdown bar per signal,
-and a price chart.
-
-## "What changed since you last checked"
-
-Every watchlist row stores a per-user `last_seen_ltp` / `last_seen_score`,
-updated a few seconds after each dashboard load (`/watchlist/mark-seen`).
-The next time you open the app, `/market/quotes` diffs the current price
-against *your* last visit - not against market open - so two users checking
-the same stock at different times each see their own "what's new" delta.
-
-## Handling the weekend / stale-data problem honestly
-
-Real intraday tick data disappears outside NSE market hours (9:15-15:30 IST,
-Mon-Fri). Rather than faking numbers, the ingestion worker:
-
-- During market hours: fetches real live quotes (Twelve Data if
-  `TWELVEDATA_API_KEY` is set, otherwise yfinance - no key required).
-- Outside market hours: **replays a real historical session** for each
-  symbol. It picks one of that stock's actual past trading days and walks
-  LTP smoothly through its *real* open -> high -> low -> close path and
-  real volume ramp. No number is invented - everything comes from a real
-  historical bar.
-- The UI always shows which mode is active (`live` vs `replay`, plus the
-  real date being replayed) so nothing is presented as live when it isn't.
-  This is deliberate: Groww's "Responsible" and "Transparent" values mean
-  the system should never quietly misrepresent data freshness.
-
-## Architecture
-
-```
-Market data API (yfinance / Twelve Data)
-        v
-Ingestion worker  --writes-->  Redis (latest quote cache + pub/sub)
-        |                              |
-        writes                          v
-        v                       API server (FastAPI, REST + WebSocket)
-   Postgres (users, watchlists,          |
-   per-user last-seen, snapshot history) v
-                                 React frontend (dark teal UI)
-```
-
-- **Redis** is the hot path: the API server never talks to the market data
-  provider directly, it just reads the latest cached quote. Adding more
-  users doesn't add more provider calls - only adding more *distinct
-  symbols* does.
-- **Postgres** holds durable state: accounts, per-user watchlists, and a
-  timestamped snapshot history per symbol (used for the chart and for
-  auditing what the score was at any past moment).
-- **WebSocket** clients subscribe once; the worker's Redis publish fans out
-  to every connected browser without each client polling the API.
-- This scales by sharding ingestion across symbol ranges and adding stateless
-  API server replicas behind Redis pub/sub - user growth and symbol growth
-  scale independently.
 
 ## Running it step by step
 
@@ -126,23 +52,87 @@ Ingestion worker  --writes-->  Redis (latest quote cache + pub/sub)
    docker compose down -v       # also wipe the Postgres volume
    ```
 
-### Using a real API key (optional)
 
-By default the system runs with **zero API keys** using yfinance. To use a
-real provider key instead:
 
-1. Get a free key at https://twelvedata.com/
-2. Open `backend/.env` (the one you created in step 2 above) and set
-   `TWELVEDATA_API_KEY=<your key>`
-3. `docker compose up --build` (rebuild isn't strictly required for an env
-   change, but `docker compose restart backend worker` is enough if you'd
-   rather not rebuild)
 
-### Forcing replay mode for a demo
 
-Set `DATA_PROVIDER=replay` in `backend/.env` to always use the real-history
-replay engine, regardless of actual market hours - useful for rehearsing a
-demo on a weekend without waiting for Monday.
+## The Core Idea 
+### 1. Meaningful Change Score (MCS)
+
+A raw "% change" number treats a 2% move in a sleepy PSU bank the same as a
+2% move in a small-cap that swings that much every day. MCS instead asks:
+*relative to how this stock normally behaves, is today's move actually
+unusual - and is anything corroborating it?*
+
+Four signals, each explainable on their own, combined into one 0-100 score
+(see `backend/app/scoring.py`):
+
+| Signal | What it measures |
+|---|---|
+| Volatility z-score | Is `\|% change\|` large vs. this stock's own trailing 20-day volatility? |
+| Volume ratio | Is volume unusually high vs. its trailing average (conviction, not just noise)? |
+| 52-week proximity | Is the move pushing the stock toward/through a real breakout level, in the direction it's already moving? |
+| Index divergence | Is the stock doing something different from Nifty 50 (idiosyncratic vs. "the whole market moved")? |
+
+The weights are simple, documented constants - not a hidden model - so the
+score stays explainable. Clicking any stock shows the score, a plain-English
+reason (e.g. *"Up 6.2% - a 5.6x larger move than its usual daily swing; on
+5.0x average volume; near its 52-week high"*), a breakdown bar per signal,
+and a price chart.
+
+### 2. "What changed since you last checked"
+
+Every watchlist row stores a per-user `last_seen_ltp` / `last_seen_score`,
+updated a few seconds after each dashboard load (`/watchlist/mark-seen`).
+The next time you open the app, `/market/quotes` diffs the current price
+against *your* last visit - not against market open - so two users checking
+the same stock at different times each see their own "what's new" delta.
+
+### 3. Handling the weekend / stale-data problem honestly
+
+Real intraday tick data disappears outside NSE market hours (9:15-15:30 IST,
+Mon-Fri). Rather than faking numbers, the ingestion worker:
+
+- During market hours: fetches real live quotes (Twelve Data if
+  `TWELVEDATA_API_KEY` is set, otherwise yfinance - no key required).
+- Outside market hours: **replays a real historical session** for each
+  symbol. It picks one of that stock's actual past trading days and walks
+  LTP smoothly through its *real* open -> high -> low -> close path and
+  real volume ramp. No number is invented - everything comes from a real
+  historical bar.
+- The UI always shows which mode is active (`live` vs `replay`, plus the
+  real date being replayed) so nothing is presented as live when it isn't.
+  This is deliberate: Groww's "Responsible" and "Transparent" values mean
+  the system should never quietly misrepresent data freshness.
+
+## Architecture
+
+```
+Market data API (yfinance / Twelve Data)
+        v
+Ingestion worker  --writes-->  Redis (latest quote cache + pub/sub)
+        |                              |
+        writes                          v
+        v                       API server (FastAPI, REST + WebSocket)
+   Postgres (users, watchlists,          |
+   per-user last-seen, snapshot history) v
+                                 React frontend (dark teal UI)
+```
+
+- **Redis** is the hot path: the API server never talks to the market data
+  provider directly, it just reads the latest cached quote. Adding more
+  users doesn't add more provider calls - only adding more *distinct
+  symbols* does.
+- **Postgres** holds durable state: accounts, per-user watchlists, and a
+  timestamped snapshot history per symbol (used for the chart and for
+  auditing what the score was at any past moment).
+- **WebSocket** clients subscribe once; the worker's Redis publish fans out
+  to every connected browser without each client polling the API.
+- This scales by sharding ingestion across symbol ranges and adding stateless
+  API server replicas behind Redis pub/sub - user growth and symbol growth
+  scale independently.
+
+
 
 ### Troubleshooting
 
